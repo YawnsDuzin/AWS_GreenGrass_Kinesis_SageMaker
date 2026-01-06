@@ -1,0 +1,57 @@
+---
+# GreenGrass V2 Component Recipe
+# 스트림 데이터 내보내기 컴포넌트 - Raspberry Pi 4 (64-bit)
+
+RecipeFormatVersion: "2020-01-25"
+
+ComponentName: com.construction.StreamExporter
+ComponentVersion: "1.0.0"
+ComponentDescription: |
+  엣지 데이터를 클라우드로 내보내는 컴포넌트
+  - 로컬 버퍼링 및 배치 전송
+  - 네트워크 장애 시 자동 재시도
+  - 대역폭 최적화
+
+ComponentPublisher: ConstructionSafety
+ComponentConfiguration:
+  DefaultConfiguration:
+    # Kinesis 설정
+    kinesis_stream_name: "safety-detection-stream"
+    region: "ap-northeast-2"
+
+    # 배치 설정
+    batch_size: 100
+    batch_interval_ms: 5000
+
+    # 버퍼 설정
+    buffer_size_mb: 256
+    max_retry_attempts: 3
+
+ComponentDependencies:
+  aws.greengrass.StreamManager:
+    VersionRequirement: ">=2.0.0"
+    DependencyType: HARD
+  aws.greengrass.TokenExchangeService:
+    VersionRequirement: ">=2.0.0"
+    DependencyType: HARD
+
+Manifests:
+  - Platform:
+      os: linux
+      architecture: aarch64
+    Lifecycle:
+      Install:
+        Script: |
+          #!/bin/bash
+          python3 -m venv {artifacts:path}/venv
+          {artifacts:path}/venv/bin/pip install -r {artifacts:path}/requirements.txt
+
+      Run:
+        Script: |
+          #!/bin/bash
+          {artifacts:path}/venv/bin/python3 {artifacts:path}/stream_exporter.py \
+            --config '{configuration:/}'
+
+    Artifacts:
+      - URI: s3://greengrass-components-bucket/com.construction.StreamExporter/1.0.0/stream_exporter.zip
+        Unarchive: ZIP

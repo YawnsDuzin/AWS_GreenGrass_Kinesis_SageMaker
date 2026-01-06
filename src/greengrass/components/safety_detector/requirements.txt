@@ -1,0 +1,19 @@
+# 건설현장 안전 감지 컴포넌트 - Raspberry Pi 4 (64-bit) 의존성
+# Python 3.9+ 필요
+
+# AWS IoT GreenGrass SDK
+awsiotsdk>=1.12.0
+awscrt>=0.16.0
+
+# Stream Manager (GreenGrass 패키지에 포함)
+# stream_manager 는 GreenGrass 런타임에서 제공
+
+# 컴퓨터 비전 (Raspberry Pi 최적화)
+# OpenCV는 시스템 패키지로 설치 (apt install python3-opencv)
+numpy>=1.21.0,<2.0.0
+
+# 이미지 처리 (선택적)
+Pillow>=9.0.0
+
+# 유틸리티
+python-dateutil>=2.8.0

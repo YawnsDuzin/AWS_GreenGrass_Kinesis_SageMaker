@@ -1,0 +1,120 @@
+---
+# GreenGrass V2 Component Recipe
+# 건설현장 안전 감지 컴포넌트 - Raspberry Pi 4 (64-bit) 최적화
+
+RecipeFormatVersion: "2020-01-25"
+
+ComponentName: com.construction.SafetyDetector
+ComponentVersion: "1.0.0"
+ComponentDescription: |
+  건설현장 안전장비 감지 컴포넌트
+  - YOLOv8n 기반 객체 감지
+  - 안전모, 안전조끼, 안전화 감지
+  - Raspberry Pi 4 (64-bit Bullseye) 최적화
+
+ComponentPublisher: ConstructionSafety
+ComponentConfiguration:
+  DefaultConfiguration:
+    # 카메라 설정
+    camera_index: 0
+    frame_width: 640
+    frame_height: 480
+    fps: 15
+
+    # 모델 설정
+    model_path: "/greengrass/v2/packages/artifacts/com.construction.SafetyDetector/1.0.0/models/yolov8n_safety.onnx"
+    confidence_threshold: 0.5
+    nms_threshold: 0.4
+
+    # 추론 설정 (Raspberry Pi 4 최적화)
+    inference_threads: 4
+    use_neon: true
+
+    # Kinesis 설정
+    kinesis_stream_name: "safety-detection-stream"
+    region: "ap-northeast-2"
+
+    # 알림 설정
+    alert_cooldown_seconds: 30
+    violation_threshold: 3
+
+ComponentDependencies:
+  aws.greengrass.StreamManager:
+    VersionRequirement: ">=2.0.0"
+    DependencyType: HARD
+  aws.greengrass.TokenExchangeService:
+    VersionRequirement: ">=2.0.0"
+    DependencyType: HARD
+
+Manifests:
+  - Platform:
+      os: linux
+      architecture: aarch64
+    Lifecycle:
+      Install:
+        RequiresPrivilege: true
+        Script: |
+          #!/bin/bash
+          set -e
+
+          echo "=== Raspberry Pi 4 (64-bit) 환경 설정 ==="
+
+          # 시스템 패키지 업데이트
+          apt-get update
+
+          # 필수 패키지 설치
+          apt-get install -y \
+            python3-pip \
+            python3-venv \
+            python3-opencv \
+            libopencv-dev \
+            libatlas-base-dev \
+            libjasper-dev \
+            libqtgui4 \
+            libqt4-test \
+            libhdf5-dev \
+            v4l-utils
+
+          # Python 가상환경 생성
+          python3 -m venv {artifacts:path}/venv
+
+          # pip 업그레이드 및 패키지 설치
+          {artifacts:path}/venv/bin/pip install --upgrade pip
+          {artifacts:path}/venv/bin/pip install -r {artifacts:path}/requirements.txt
+
+          # 카메라 권한 설정
+          usermod -aG video ggc_user || true
+
+          echo "=== 설치 완료 ==="
+
+      Run:
+        RequiresPrivilege: false
+        Script: |
+          #!/bin/bash
+          cd {artifacts:path}
+
+          # 환경 변수 설정
+          export OPENBLAS_NUM_THREADS=4
+          export OMP_NUM_THREADS=4
+
+          # 컴포넌트 실행
+          {artifacts:path}/venv/bin/python3 {artifacts:path}/safety_detector.py \
+            --config '{configuration:/}'
+
+      Shutdown:
+        Script: |
+          #!/bin/bash
+          echo "안전 감지 컴포넌트 종료 중..."
+          pkill -f "safety_detector.py" || true
+
+    Artifacts:
+      - URI: s3://greengrass-components-bucket/com.construction.SafetyDetector/1.0.0/safety_detector.zip
+        Unarchive: ZIP
+        Permission:
+          Read: OWNER
+          Execute: OWNER
+
+Lifecycle:
+  Startup:
+    Script: |
+      echo "Safety Detector starting on Raspberry Pi 4..."

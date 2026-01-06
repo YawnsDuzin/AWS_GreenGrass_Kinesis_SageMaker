@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: '건설현장 안전 모니터링 시스템 - 메인 스택 (Raspberry Pi 4 엣지 디바이스)'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: 배포 환경
+
+  ProjectName:
+    Type: String
+    Default: construction-safety
+    Description: 프로젝트 이름
+
+Resources:
+  # ============================================
+  # Kinesis Data Streams
+  # ============================================
+  SafetyDetectionStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub ${ProjectName}-detection-stream-${Environment}
+      ShardCount: 2
+      RetentionPeriodHours: 24
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================
+  # Kinesis Firehose (S3 전송)
+  # ============================================
+  DataDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub ${ProjectName}-to-s3-${Environment}
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt SafetyDetectionStream.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt DataBucket.Arn
+        Prefix: !Sub 'raw/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        ErrorOutputPrefix: 'errors/'
+        BufferingHints:
+          SizeInMBs: 5
+          IntervalInSeconds: 300
+        CompressionFormat: GZIP
+        RoleARN: !GetAtt FirehoseRole.Arn
+
+  # ============================================
+  # S3 버킷
+  # ============================================
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-data-${Environment}-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-models-${Environment}-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+
+  # ============================================
+  # DynamoDB
+  # ============================================
+  SafetyEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-events-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      GlobalSecondaryIndexes:
+        - IndexName: severity-index
+          KeySchema:
+            - AttributeName: severity
+              KeyType: HASH
+            - AttributeName: sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ============================================
+  # SNS Topic (알림)
+  # ============================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-alerts-${Environment}
+      DisplayName: Safety Violation Alerts
+
+  # ============================================
+  # Lambda Functions
+  # ============================================
+  ProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-processor-${Environment}
+      Runtime: python3.11
+      Handler: handler.lambda_handler
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref SafetyEventsTable
+          SNS_TOPIC_ARN: !Ref AlertTopic
+
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref ProcessorLambda
+      EventSourceArn: !GetAtt SafetyDetectionStream.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+
+  # ============================================
+  # IoT Core
+  # ============================================
+  IoTPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-device-policy-${Environment}
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iot:Connect
+              - iot:Publish
+              - iot:Subscribe
+              - iot:Receive
+            Resource: '*'
+
+  IoTTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub ${ProjectName}_violations_${Environment}
+      TopicRulePayload:
+        Sql: "SELECT * FROM 'construction/safety/+/violations'"
+        Actions:
+          - Kinesis:
+              StreamName: !Ref SafetyDetectionStream
+              PartitionKey: ${device_id}
+              RoleArn: !GetAtt IoTKinesisRole.Arn
+        RuleDisabled: false
+
+  # ============================================
+  # IAM Roles
+  # ============================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-lambda-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaKinesisExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource: !GetAtt SafetyEventsTable.Arn
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                Resource: !GetAtt SafetyDetectionStream.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub ${DataBucket.Arn}/*
+
+  IoTKinesisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisPut
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt SafetyDetectionStream.Arn
+
+  GreengrassRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-greengrass-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: greengrass.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGreengrassResourceAccessRolePolicy
+      Policies:
+        - PolicyName: S3ModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub ${ModelBucket.Arn}/*
+
+Outputs:
+  KinesisStreamName:
+    Description: Kinesis Data Stream 이름
+    Value: !Ref SafetyDetectionStream
+    Export:
+      Name: !Sub ${ProjectName}-stream-${Environment}
+
+  DataBucketName:
+    Description: 데이터 S3 버킷 이름
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub ${ProjectName}-data-bucket-${Environment}
+
+  DynamoDBTableName:
+    Description: DynamoDB 테이블 이름
+    Value: !Ref SafetyEventsTable
+    Export:
+      Name: !Sub ${ProjectName}-table-${Environment}
+
+  SNSTopicArn:
+    Description: SNS 알림 토픽 ARN
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub ${ProjectName}-sns-${Environment}
+
+  GreengrassRoleArn:
+    Description: GreenGrass IAM 역할 ARN
+    Value: !GetAtt GreengrassRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-gg-role-${Environment}
